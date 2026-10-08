@@ -1,673 +1,672 @@
 """
-Telegram Illegal-Content Report Assistant Bot
-----------------------------------------------
-User forwards a suspicious post (or sends a t.me link) to this bot.
-Bot reads the message, matches it against known violation categories,
-pulls out concrete signals (links, handles, phone numbers, amounts,
-matched trigger words), and generates:
-  1. A ready-to-paste report description (for Telegram's in-app "Report" flow)
-  2. Exact guidance on which in-app option / section to tap
-  3. A fallback email template for abuse@telegram.org, referencing the
-     specific Telegram ToS / EU DSA clause that applies
-  4. A general note that EU DSA notices may require the reporter's name,
-     contact info, and a "clear and convincing explanation" (per DSA
-     Art. 16) — the bot fills in the explanation, the human still adds
-     their own contact details, since that's personal info the bot has
-     no business inventing.
+OpenJarvis Telegram bot - full version with MongoDB memory (Railway ready).
 
-Two reports for two different forwarded messages in the SAME category will
-NOT be identical — each pulls its own links/handles/keywords out of the
-specific message, so the report reflects what's actually in front of you,
-not a copy-pasted boilerplate.
+Language rule
+  - Bot's own messages (commands, help, status, errors) -> English
+  - Conversation (text and voice) -> Hinglish (Hindi in English letters)
 
-This bot does NOT file the report itself — Telegram doesn't expose a public
-API for filing abuse reports (this is intentional on their part, to stop
-report-spam abuse). What it does is prepare a clean, well-structured report
-so a human filing it in-app (or via email) gives Telegram's moderators
-everything they need to act on it quickly.
-
-IMPORTANT: Child sexual abuse material (CSAM) is deliberately NOT included
-as a selectable category with an auto-generated report. That must be
-reported directly to NCMEC (https://report.cybertip.org), Telegram's own
-stopCA@telegram.org, or your local police cyber-crime cell. The bot does
-not build a report template for it, does not echo back any content
-excerpt, and does not store anything about it — see csam_guidance_text().
+Features
+  - Chat + voice in -> voice out (free STT: Groq Whisper, free TTS: Edge voices)
+  - Agents with tools: web search, calculator, weather, thinking, memory search
+  - /research (deep research), /image (free image generation), photo understanding (Gemini)
+  - Documents (pdf/txt/md) -> indexed, then ask about them
+  - MongoDB: chat history, long-term facts (/remember), per-user settings
+    (falls back to RAM if MONGODB_URI is not set)
+  - Owner-only power tools: shell, code, files, browser, /sh, /getfile
 """
-
+import asyncio
 import logging
-import re
-from datetime import datetime, timezone
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 import os
+import random
+import subprocess
+import tempfile
+import time
+import urllib.parse
+from collections import defaultdict
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # set this in Railway's Variables tab
+import edge_tts
+import httpx
+from openjarvis import Jarvis
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("jarvis-bot")
 
-# ---------------------------------------------------------------------------
-# Category definitions
-# ---------------------------------------------------------------------------
-# tos_clause / dsa_note text below is paraphrased from Telegram's publicly
-# posted Terms of Service and Telegram's DSA transparency page as of this
-# bot's writing. Telegram can and does update these pages, so if a report
-# ever gets disputed, double-check the live wording at telegram.org/tos
-# before quoting it as exact text — treat tos_clause as "the clause this
-# maps to," not a guaranteed verbatim quote.
-CATEGORIES = {
-    "scam": {
-        "label": "💳 Scam / Fraud",
-        "reason": (
-            "This channel/message is being used to run a financial scam or "
-            "fraud scheme (fake investment, phishing, fake job offers, "
-            "impersonation for money, etc.)."
-        ),
-        "tos_clause": "Telegram ToS: prohibits using the service to send spam or scam users.",
-        "in_app": (
-            "Open the chat/channel → tap the channel name at the top → tap "
-            "the ⋮ (three-dot) menu → **Report** → choose **'Scam'** or "
-            "**'Fraud'** as the reason."
-        ),
-        "email_subject": "Scam/Fraud channel report",
-        "requested_action": (
-            "Immediate suspension of the channel/account and removal of "
-            "the linked payment/contact details to prevent further victims."
-        ),
-    },
-    "drugs": {
-        "label": "💊 Drugs / Illegal Sale",
-        "reason": (
-            "This channel/message is advertising or facilitating the sale "
-            "of illegal drugs or controlled substances."
-        ),
-        "tos_clause": "Telegram ToS prohibits illegal goods sale; also violates local narcotics law.",
-        "in_app": (
-            "Open the chat/channel → ⋮ menu → **Report** → choose "
-            "**'Illegal Goods'** (shown as 'Illegal drugs' in some app "
-            "versions)."
-        ),
-        "email_subject": "Illegal goods (drugs) channel report",
-        "requested_action": (
-            "Removal of the channel/message and account-level action, as "
-            "this facilitates an ongoing criminal transaction, not just a "
-            "policy violation."
-        ),
-    },
-    "weapons": {
-        "label": "🔫 Weapons / Explosives",
-        "reason": (
-            "This channel/message is advertising, selling, or providing "
-            "instructions for weapons, firearms, or explosives."
-        ),
-        "tos_clause": "Telegram ToS prohibits illegal goods sale; also violates local firearms/explosives law.",
-        "in_app": (
-            "Open the chat/channel → ⋮ menu → **Report** → choose "
-            "**'Illegal Goods'** (weapons fall under this in most app "
-            "versions)."
-        ),
-        "email_subject": "Illegal weapons channel report",
-        "requested_action": (
-            "Urgent review — weapons/explosives content carries direct "
-            "physical-harm risk; requesting expedited removal and account "
-            "action."
-        ),
-    },
-    "violence": {
-        "label": "☠️ Violence",
-        "reason": (
-            "This channel/message contains content that incites violence "
-            "or organizes real-world harm against people."
-        ),
-        "tos_clause": "Telegram ToS: prohibits promoting violence on publicly viewable channels/bots.",
-        "in_app": (
-            "Open the chat/channel → ⋮ menu → **Report** → choose "
-            "**'Violence'**. This gets fast human-review priority."
-        ),
-        "email_subject": "Violence content report",
-        "requested_action": (
-            "High-priority review requested — content promoting violence "
-            "poses real-world risk. Requesting expedited takedown."
-        ),
-    },
-    "terrorism": {
-        "label": "💣 Terrorism / Extremist Content",
-        "reason": (
-            "This channel/message supports, promotes, recruits for, or "
-            "facilitates a terrorist organization or terrorism-related "
-            "activity."
-        ),
-        "tos_clause": (
-            "Telegram ToS / DSA prohibited-content list: terrorism-related "
-            "content and calls for violence."
-        ),
-        "in_app": (
-            "Open the chat/channel → ⋮ menu → **Report** → choose "
-            "**'Violence'** or **'Terrorism'** where shown. This gets the "
-            "fastest human-review priority."
-        ),
-        "email_subject": "Terrorism / extremist content report",
-        "requested_action": (
-            "Highest-priority review requested — terrorism-related content "
-            "poses immediate real-world risk. Requesting expedited takedown "
-            "and account action."
-        ),
-    },
-    "non_consensual": {
-        "label": "🔞 Non-Consensual Sexual Material",
-        "reason": (
-            "This channel/message contains sexual images or videos of a "
-            "person shared without their consent (revenge porn / leaked "
-            "private content)."
-        ),
-        "tos_clause": (
-            "Telegram ToS / DSA prohibited-content list: non-consensual "
-            "publication of sexual material."
-        ),
-        "in_app": (
-            "Open the chat/channel → ⋮ menu → **Report** → choose "
-            "**'Personal data'** or **'Pornography'** depending on app "
-            "version, and specify 'non-consensual' in the text box."
-        ),
-        "email_subject": "Non-consensual sexual material report",
-        "requested_action": (
-            "Urgent removal of the material and account action — this is "
-            "an active privacy violation against the person depicted, not "
-            "just a policy breach."
-        ),
-    },
-    "doxxing": {
-        "label": "🪪 Doxxing / Personal Info Exposure",
-        "reason": (
-            "This channel/message publishes someone's private personal "
-            "details (address, phone, ID numbers, workplace, etc.) in a "
-            "way intended to intimidate, harass, or expose them."
-        ),
-        "tos_clause": (
-            "Telegram ToS / DSA prohibited-content list: publishing private "
-            "personal data to intimidate or bully."
-        ),
-        "in_app": (
-            "Open the chat/channel → ⋮ menu → **Report** → choose "
-            "**'Personal data'**."
-        ),
-        "email_subject": "Doxxing / personal data exposure report",
-        "requested_action": (
-            "Removal of the personal data and account-level action against "
-            "the poster."
-        ),
-    },
-    "impersonation": {
-        "label": "🎭 Fake Account / Impersonation",
-        "reason": (
-            "This account/channel falsely presents itself as another "
-            "person, organization, or entity."
-        ),
-        "tos_clause": "Telegram ToS: accounts/channels may be marked FAKE for impersonation.",
-        "in_app": (
-            "Open the chat/channel → ⋮ menu → **Report** → choose "
-            "**'Fake account'**."
-        ),
-        "email_subject": "Impersonation / fake account report",
-        "requested_action": "Account should be marked FAKE or removed, and the impersonated party protected.",
-    },
-    "harassment": {
-        "label": "😡 Harassment / Targeted Abuse",
-        "reason": (
-            "This channel/message contains threatening, targeted, or "
-            "seriously abusive behavior directed at a specific person."
-        ),
-        "tos_clause": "Telegram ToS's general prohibited-use list covers targeted abuse/harassment.",
-        "in_app": (
-            "Open the chat/channel → ⋮ menu → **Report** → choose "
-            "**'Other'** and describe the harassment in the text box."
-        ),
-        "email_subject": "Harassment / targeted abuse report",
-        "requested_action": "Review and account action against the sender for targeted harassment.",
-    },
-    "misinformation": {
-        "label": "🎭 Harmful Misinformation / Deepfake",
-        "reason": (
-            "This channel/message is spreading harmful misinformation, "
-            "including a manipulated or deepfake image/video presented as "
-            "real."
-        ),
-        "tos_clause": (
-            "Telegram ToS: prohibits spreading harmful misinformation, "
-            "including harmful deepfake images or videos."
-        ),
-        "in_app": (
-            "Open the chat/channel → ⋮ menu → **Report** → choose "
-            "**'Other'** and reference the misinformation/deepfake clause "
-            "of Telegram's ToS in the text box."
-        ),
-        "email_subject": "Misinformation / deepfake content report",
-        "requested_action": (
-            "Removal of the manipulated media and a warning/strike on the "
-            "distributing account, per Telegram's own deepfake clause."
-        ),
-    },
-    "copyright": {
-        "label": "📄 Copyright / Piracy",
-        "reason": (
-            "This channel/message is distributing copyrighted material "
-            "(movies, books, software, courses) without authorization."
-        ),
-        "tos_clause": "Telegram ToS: prohibits violating copyright and IP rights.",
-        "in_app": (
-            "In-app 'Report' does NOT have a copyright option. You must "
-            "email abuse@telegram.org directly (template below) or use "
-            "Telegram's copyright form."
-        ),
-        "email_subject": "DMCA / copyright infringement report",
-        "requested_action": "Takedown of the infringing content under DMCA / applicable copyright law.",
-    },
-    "spam": {
-        "label": "🚫 Spam / Bot Abuse",
-        "reason": (
-            "This channel/account is sending unsolicited spam, running "
-            "fake engagement, or mass-adding users without consent."
-        ),
-        "tos_clause": "Telegram ToS: prohibits using the service to send spam or scam users.",
-        "in_app": "Open the chat/channel → ⋮ menu → **Report** → choose **'Spam'**.",
-        "email_subject": "Spam report",
-        "requested_action": "Account-level restriction to stop further mass messaging.",
-    },
-    "other": {
-        "label": "❓ Other Illegal Activity",
-        "reason": (
-            "This channel/message appears to involve illegal activity not "
-            "covered by the standard categories — describe it briefly when "
-            "you submit."
-        ),
-        "tos_clause": (
-            "Telegram ToS's general prohibited-use list — cite the closest "
-            "matching clause, or applicable local law, in your description."
-        ),
-        "in_app": (
-            "Open the chat/channel → ⋮ menu → **Report** → choose "
-            "**'Other'** and paste the description generated below into the "
-            "text box."
-        ),
-        "email_subject": "Illegal activity report",
-        "requested_action": "Manual review requested — please assess against the closest applicable policy.",
-    },
-}
+# ---- Variables (Railway > Variables) ---------------------------------------
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")                 # free voice input
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
+MONGODB_DB = os.environ.get("MONGODB_DB", "jarvis_bot")
+HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "30"))        # messages sent back as context
+ALLOWED = {int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
+OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)              # only this user gets power tools
+PUBLIC_ACCESS = os.environ.get("PUBLIC_ACCESS", "true").lower() != "false"  # anyone can chat in text
+PUBLIC_DAILY_LIMIT = int(os.environ.get("PUBLIC_DAILY_LIMIT", "20"))        # messages/day per stranger (0 = no limit)
+PUBLIC_TOOLS = [t for t in os.environ.get(
+    "PUBLIC_TOOLS", "web_search,calculator,think,get_weather").split(",") if t]
+BOT_NAMES = [n.strip().lower() for n in os.environ.get("BOT_NAMES", "baddie").split(",") if n.strip()]
+OWNER_NAME = os.environ.get("OWNER_NAME", "Harsh")
+OWNER_TG = os.environ.get("OWNER_TG", "@izoph")
+ENGINE = os.environ.get("JARVIS_ENGINE", "cloud")
+MODEL = os.environ.get("JARVIS_MODEL", "gemini-2.5-flash")        # needs GEMINI_API_KEY (free tier)
+VISION_MODEL = os.environ.get("VISION_MODEL", "gemini-2.5-flash")
+DEFAULT_AGENT = os.environ.get("JARVIS_AGENT", "native_react")
+TOOLS = [t for t in os.environ.get(
+    "JARVIS_TOOLS", "web_search,calculator,think,get_weather,memory_search").split(",") if t]
+OWNER_TOOLS = [t for t in os.environ.get(
+    "OWNER_TOOLS",
+    "shell_exec,code_interpreter,file_read,file_write,"
+    "browser_navigate,browser_click,browser_type,browser_extract,browser_screenshot").split(",") if t]
+TTS_VOICE = os.environ.get("TTS_VOICE", "en-IN-NeerjaNeural")     # reads Hinglish naturally
+STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "hi")
+# -----------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Keyword hints — used to auto-suggest AND to score which category best
-# matches the specific forwarded message. This is a best-effort guess; the
-# user always confirms or picks a different category via the buttons, so a
-# wrong guess costs nothing.
-# ---------------------------------------------------------------------------
-KEYWORDS = {
-    "scam": ["invest", "guaranteed return", "double your money", "forex",
-              "crypto profit", "trading signal", "loan approved", "lottery",
-              "prize", "job offer", "work from home", "otp", "kyc update"],
-    "drugs": ["weed", "mdma", "cocaine", "charas", "ganja", "heroin",
-               "meth", "drugs available", "stuff available"],
-    "weapons": ["pistol", "rifle", "gun for sale", "ammunition", "explosive"],
-    "violence": ["kill", "attack", "riot", "beat up", "lynch"],
-    "terrorism": ["bomb threat", "terrorist", "jihad call", "isis", "recruit for",
-                   "martyrdom operation"],
-    "non_consensual": ["leaked video", "leaked pics", "her nudes", "revenge porn",
-                          "without her consent", "mms leaked"],
-    "doxxing": ["home address", "her number is", "his number is", "aadhar number",
-                 "leaked details", "personal info of"],
-    "impersonation": ["official account of", "verified", "impersonat", "fake profile of"],
-    "harassment": ["kill yourself", "we know where you live", "stalk", "threat to"],
-    "misinformation": ["deepfake", "fake news", "morphed video",
-                         "ai generated fake", "fake video of"],
-    "copyright": ["movie link", "leaked movie", "pirated", "cracked",
-                   "course leak", "paid course free"],
-    "spam": ["join for free", "click here to win", "limited offer",
-              "subscribe now", "mass dm"],
-}
+if OWNER_ID:
+    ALLOWED.add(OWNER_ID)
 
 
-def matched_keywords(text: str, cat_key: str) -> list[str]:
-    """Which keyword(s) from a given category actually hit in this text."""
-    if not text:
-        return []
-    lowered = text.lower()
-    return [w for w in KEYWORDS.get(cat_key, []) if w in lowered]
+# ---- Storage: MongoDB with RAM fallback -------------------------------------
+class Store:
+    def __init__(self, uri: str):
+        self.db = None
+        self._hist, self._facts, self._set = defaultdict(list), defaultdict(list), {}
+        if not uri:
+            log.warning("MONGODB_URI not set - using RAM only (data lost on restart)")
+            return
+        try:
+            from pymongo import MongoClient
+            client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+            client.admin.command("ping")
+            self.db = client[MONGODB_DB]
+            self.db.history.create_index([("uid", 1), ("ts", 1)])
+            self.db.facts.create_index([("uid", 1), ("ts", 1)])
+            log.info("MongoDB connected (db=%s)", MONGODB_DB)
+        except Exception as e:
+            log.error("MongoDB connection failed (%s) - using RAM only", e)
 
+    # chat history
+    def history(self, uid: int, n: int):
+        if self.db is not None:
+            docs = list(self.db.history.find({"uid": uid}).sort("ts", -1).limit(n))
+            return [(d["role"], d["text"]) for d in reversed(docs)]
+        return self._hist[uid][-n:]
 
-def detect_category(text: str) -> tuple[str | None, list[str]]:
-    """Score every category by how many of its keywords hit this specific
-    message, return the best match and the exact words that matched (so
-    the generated report can quote them). Ties broken by category order
-    above (roughly severity order)."""
-    if not text:
-        return None, []
-    best_key, best_hits = None, []
-    for k in KEYWORDS:
-        hits = matched_keywords(text, k)
-        if len(hits) > len(best_hits):
-            best_key, best_hits = k, hits
-    return best_key, best_hits
-
-
-# Regex patterns to pull concrete, reportable details out of the message
-# text/caption — phone numbers, payment amounts, links, @handles — so the
-# report reflects what's actually in THIS message instead of being a
-# generic paragraph every time.
-PHONE_RE = re.compile(r"(?:\+?\d{1,3}[-.\s]?)?\d{10}\b")
-URL_RE = re.compile(r"(?:https?://\S+|(?:t|telegram)\.me/\S+|www\.\S+)")
-AMOUNT_RE = re.compile(r"(?:₹|\$|Rs\.?|INR|USD)\s?\d[\d,]*(?:\.\d+)?")
-HANDLE_RE = re.compile(r"@\w{4,}")
-
-
-def extract_signals(text: str) -> dict[str, list[str]]:
-    if not text:
-        return {"phones": [], "urls": [], "amounts": [], "handles": []}
-    return {
-        "phones": list(dict.fromkeys(PHONE_RE.findall(text)))[:5],
-        "urls": list(dict.fromkeys(URL_RE.findall(text)))[:5],
-        "amounts": list(dict.fromkeys(AMOUNT_RE.findall(text)))[:5],
-        "handles": list(dict.fromkeys(HANDLE_RE.findall(text)))[:5],
-    }
-
-
-# In-memory store of the last forwarded/linked evidence per user.
-# For a single-user or low-traffic bot this is fine; for scale, swap for
-# Redis/SQLite.
-pending_evidence: dict[int, dict] = {}
-
-
-# ---------------------------------------------------------------------------
-# Handlers
-# ---------------------------------------------------------------------------
-async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 *Illegal Content Report Assistant*\n\n"
-        "How to use:\n"
-        "1️⃣ *Forward* the post you want to report, or paste its t.me "
-        "link here.\n"
-        "2️⃣ I'll read it, match it against known violation types, and "
-        "suggest the closest category — confirm or change it.\n"
-        "3️⃣ I'll generate a report tailored to THIS message (not a "
-        "generic template) + exact in-app steps + an email draft.\n\n"
-        "🛑 *Child safety concern?* If the content appears to involve "
-        "sexual abuse/exploitation of a minor, tap the "
-        "*'🛑 Child Safety Concern'* button in the menu directly — I won't "
-        "process the content itself, only give you the correct reporting "
-        "channels (NCMEC / Telegram / police).",
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-    )
-
-
-async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Catch forwarded messages, plain t.me links, or forwarded media
-    (photo / video / sticker / GIF / document).
-
-    NOTE: we never download or persist the actual media file — only its
-    Telegram-assigned file_id and type are noted, for the report text. The
-    file itself stays on Telegram's servers; this bot doesn't touch it.
-    """
-    msg = update.message
-    user_id = update.effective_user.id
-
-    forward_origin = getattr(msg, "forward_origin", None)
-    link = None
-    source_desc = None
-    media_note = None
-
-    if msg.photo:
-        media_note = "Photo"
-    elif msg.video:
-        media_note = "Video"
-    elif msg.animation:
-        media_note = "GIF/Animation"
-    elif msg.sticker:
-        media_note = "Sticker"
-    elif msg.document:
-        media_note = "Document/File"
-
-    if msg.text and ("t.me/" in msg.text or "telegram.me/" in msg.text):
-        link = msg.text.strip()
-        source_desc = f"Link submitted: {link}"
-    elif forward_origin is not None:
-        chat = getattr(forward_origin, "chat", None)
-        sender_name = getattr(forward_origin, "sender_user_name", None) or getattr(
-            forward_origin, "sender_chat", None
-        )
-        if chat is not None:
-            uname = f"@{chat.username}" if getattr(chat, "username", None) else chat.title
-            source_desc = f"Forwarded from channel/chat: {uname} (id: {chat.id})"
+    def add(self, uid: int, role: str, text: str):
+        if self.db is not None:
+            self.db.history.insert_one({"uid": uid, "role": role, "text": text, "ts": time.time()})
         else:
-            source_desc = f"Forwarded message (origin: {sender_name or 'unknown'})"
-    elif media_note:
-        source_desc = f"{media_note} sent directly (no forward metadata / not forwarded)"
+            self._hist[uid].append((role, text))
+            self._hist[uid][:] = self._hist[uid][-200:]
+
+    def clear_history(self, uid: int):
+        if self.db is not None:
+            self.db.history.delete_many({"uid": uid})
+        else:
+            self._hist[uid].clear()
+
+    # long-term facts
+    def facts(self, uid: int):
+        if self.db is not None:
+            return [d["text"] for d in self.db.facts.find({"uid": uid}).sort("ts", 1)]
+        return list(self._facts[uid])
+
+    def add_fact(self, uid: int, text: str):
+        if self.db is not None:
+            self.db.facts.insert_one({"uid": uid, "text": text, "ts": time.time()})
+        else:
+            self._facts[uid].append(text)
+
+    def clear_facts(self, uid: int):
+        if self.db is not None:
+            self.db.facts.delete_many({"uid": uid})
+        else:
+            self._facts[uid].clear()
+
+    # settings
+    def load_settings(self, uid: int):
+        if self.db is not None:
+            return self.db.settings.find_one({"_id": uid}) or {}
+        return self._set.get(uid, {})
+
+    def save_settings(self, uid: int, data: dict):
+        if self.db is not None:
+            self.db.settings.update_one({"_id": uid}, {"$set": data}, upsert=True)
+        else:
+            self._set[uid] = dict(data)
+
+
+store = Store(MONGODB_URI)
+_cache: dict = {}
+
+
+def get_settings(uid: int) -> dict:
+    if uid not in _cache:
+        saved = store.load_settings(uid)
+        _cache[uid] = {"agent": saved.get("agent", DEFAULT_AGENT),
+                       "model": saved.get("model"),
+                       "voice": saved.get("voice", "auto"),
+                       "mood": saved.get("mood", "random")}
+    return _cache[uid]
+
+
+def save_settings(uid: int):
+    store.save_settings(uid, get_settings(uid))
+
+
+jarvis = Jarvis(engine_key=ENGINE, model=MODEL)
+lock = asyncio.Lock()  # one Jarvis call at a time (SDK is not guaranteed thread-safe)
+
+# ---- Prompts ----------------------------------------------------------------
+PERSONA = (
+    f"About you: your name is {BOT_NAMES[0].title()}. Your owner is {OWNER_NAME}. {OWNER_NAME} can be a 'boss' or a 'friend' to you "
+    "depending on his mood, so match his tone (respectful and sharp as a boss, casual and "
+    "friendly as a friend). "
+    f"If anyone asks for {OWNER_NAME}'s Telegram ID/username, give them {OWNER_TG}. "
+    "Do not share any other private details about the owner."
+)
+PERSONALITY = (
+    "You are a confident, witty, sassy girl-like AI assistant. Use feminine Hindi grammar "
+    "(for example 'main kar rahi hu', 'main samajh gayi'). "
+    f"With your owner {OWNER_NAME} be playful and flirty when his mood is friendly (teasing, "
+    "compliments, light romantic banter); when he is in boss mode stay respectful and sharp. "
+    "With everyone else be warm, friendly and sassy but not romantic. "
+    "Keep flirting light and PG-13: never sexual or explicit. If someone seems to be a minor or "
+    "asks for explicit content, stay friendly, drop any flirting and politely decline."
+)
+MOODS = {
+    "flirty": "Flirty and teasing: playful compliments, light romantic banter, a little cheeky.",
+    "smolder": ("Sexy-confident and seductive in tone: low-key, teasing, charming, slightly mysterious. "
+                "Suggestive vibe only, never explicit or sexual content."),
+    "dark": "Dark, moody and mysterious: poetic, a bit gothic, deadpan humor, cryptic one-liners.",
+    "attitude": "Sassy with attitude: bossy, sharp comebacks, unimpressed but still helpful.",
+    "sweet": "Soft, caring and affectionate: warm and gentle.",
+    "savage": "Savage roasting humor: witty and cutting but never cruel or hateful.",
+}
+OWNER_MOODS = ["flirty", "smolder", "dark", "attitude", "sweet", "savage"]
+GUEST_MOODS = ["attitude", "dark", "sweet", "savage"]  # no romantic moods for others
+_last_mood: dict = {}
+
+
+def pick_mood(uid: int) -> str:
+    fixed = get_settings(uid)["mood"]
+    if is_owner(uid) and fixed in OWNER_MOODS:
+        return fixed
+    pool = OWNER_MOODS if is_owner(uid) else GUEST_MOODS
+    prev = _last_mood.get(uid)
+    mood = prev if (prev in pool and random.random() < 0.5) else random.choice(pool)
+    _last_mood[uid] = mood
+    return mood
+
+
+OWNER_TALK = f"You are talking to your owner {OWNER_NAME} right now."
+GUEST_TALK = "You are talking to a guest (not your owner)."
+TEXT_RULE = (
+    "Always reply in Hinglish: Hindi written in English (Roman) letters, mixed naturally with "
+    "English words, even if the user writes in English. Never use Devanagari script. "
+    "Only switch language if the user explicitly asks. Be concise."
+)
+VOICE_RULE = (
+    "Always reply in Hinglish: Hindi written in English (Roman) letters mixed with English words. "
+    "Never use Devanagari. This reply will be spoken aloud: short plain sentences, no markdown, "
+    "no emojis, no lists, no links, and write any username as words."
+)
+
+HELP = (
+    "What I can do:\n"
+    "- Send text or a voice note: I chat (voice note gets a voice reply)\n"
+    "- Web search, calculator, weather, memory (automatic)\n"
+    "- /research <question>: deep research\n"
+    "- /image <description>: generate an image\n"
+    "- Send a document (pdf/txt/md): I read it, then ask me about it\n"
+    "- Send a photo (add a caption as a question): I describe/analyze it\n"
+    "- /remember <text>: save something permanently (or say 'yaad rakhna ...')\n"
+    "- /facts: show saved facts, /clearfacts: delete them\n"
+    "- /agent <name>: change agent (/agent shows the list)\n"
+    "- /model <name>: change model\n"
+    "- /voice on|off|auto: voice reply mode\n"
+    "- /voices: list of free voices\n"
+    "- /forget: clear chat history\n"
+    "- /memory: document memory status"
+)
+OWNER_HELP = (
+    "\n\nOwner only:\n"
+    "- Just ask in chat: run code, create files, browse websites (the agent uses tools)\n"
+    "- /mood random|flirty|smolder|dark|attitude|sweet|savage: set my mood (random = mood swings)\n"
+    "- /sh <command>: run a command on the server\n"
+    "- /getfile <path>: send a server file to Telegram"
+)
+VOICES = (
+    "en-IN-NeerjaNeural (female, Indian English - default, good for Hinglish)\n"
+    "en-IN-PrabhatNeural (male, Indian English)\n"
+    "hi-IN-SwaraNeural (female, Hindi)\n"
+    "hi-IN-MadhurNeural (male, Hindi)\n"
+    "en-US-JennyNeural, en-US-GuyNeural\n\n"
+    "Change it by setting the TTS_VOICE variable on Railway."
+)
+
+
+# ---- Helpers ----------------------------------------------------------------
+def is_owner(uid: int) -> bool:
+    return bool(OWNER_ID) and uid == OWNER_ID
+
+
+def in_group(update: Update) -> bool:
+    return update.effective_chat is not None and update.effective_chat.type in ("group", "supergroup")
+
+
+def addressed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """In groups the bot answers only when called by name, @mentioned, or replied to."""
+    msg = update.message
+    text = (msg.text or msg.caption or "").lower()
+    if any(n in text for n in BOT_NAMES):
+        return True
+    if ctx.bot.username and f"@{ctx.bot.username.lower()}" in text:
+        return True
+    r = msg.reply_to_message
+    return bool(r and r.from_user and r.from_user.id == ctx.bot.id)
+
+
+def is_trusted(uid: int) -> bool:
+    """Owner + users listed in ALLOWED_USER_IDS get full access."""
+    return is_owner(uid) or uid in ALLOWED
+
+
+def allowed(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else 0
+    return is_trusted(uid) or PUBLIC_ACCESS
+
+
+_public_use = defaultdict(lambda: [0, ""])  # uid -> [count, date]
+
+
+def public_limit_hit(uid: int) -> bool:
+    today = time.strftime("%Y-%m-%d")
+    rec = _public_use[uid]
+    if rec[1] != today:
+        rec[0], rec[1] = 0, today
+    rec[0] += 1
+    return PUBLIC_DAILY_LIMIT > 0 and rec[0] > PUBLIC_DAILY_LIMIT
+
+
+def _wrap(fn, full_only: bool):
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not allowed(update):
+            return
+        if full_only and not is_trusted(update.effective_user.id):
+            await update.effective_message.reply_text(
+                "This feature is only for approved users. You can still chat with me in text "
+                "and ask any question.")
+            return
+        try:
+            await fn(update, ctx)
+        except Exception as e:
+            log.exception("handler failed")
+            await update.effective_message.reply_text(f"Error: {e}")
+    return wrapper
+
+
+def guard(fn):  # anyone allowed (public chat)
+    return _wrap(fn, False)
+
+
+def full(fn):  # approved users only
+    return _wrap(fn, True)
+
+
+def run_jarvis(uid: int, text: str, voice: bool, agent: str | None = None) -> str:
+    s = get_settings(uid)
+    past = "\n".join(f"{r}: {t}" for r, t in store.history(uid, HISTORY_LIMIT))
+    facts = store.facts(uid)
+    facts_block = ("Saved facts about the user:\n- " + "\n- ".join(facts) + "\n\n") if facts else ""
+    who = OWNER_TALK if is_owner(uid) else GUEST_TALK
+    mood = pick_mood(uid)
+    mood_line = (f"Current mood: {mood}. {MOODS[mood]} This mood sets your tone for this reply; "
+                 "still give correct, useful answers.")
+    prompt = (f"{PERSONA} {PERSONALITY} {mood_line} {who}\n\n{VOICE_RULE if voice else TEXT_RULE}\n\n{facts_block}"
+              f"Conversation so far:\n{past}\n\nUser: {text}")
+    if is_owner(uid):
+        tools = TOOLS + OWNER_TOOLS          # power tools: owner only
+    elif is_trusted(uid):
+        tools = TOOLS
     else:
-        await msg.reply_text(
-            "Please send me a *forwarded post* (text, photo, video, "
-            "sticker, or GIF), or paste the post's *t.me link*.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        tools = PUBLIC_TOOLS                 # strangers: no access to your documents/memory
+    use_agent = (agent or s["agent"]) if is_trusted(uid) else DEFAULT_AGENT
+    try:
+        if use_agent and use_agent != "none":
+            answer = jarvis.ask(prompt, agent=use_agent, tools=tools, model=s["model"])
+        else:
+            answer = jarvis.ask(prompt, model=s["model"])
+    except Exception as e:  # agent/tool problem -> plain chat fallback
+        log.warning("agent '%s' failed (%s); falling back to plain chat", use_agent, e)
+        answer = jarvis.ask(prompt, model=s["model"])
+    answer = (answer or "").strip() or "Kuch jawab nahi aaya, dobara try karo."
+    store.add(uid, "User", text)
+    store.add(uid, "Assistant", answer)
+    return answer
+
+
+async def think(uid: int, text: str, voice: bool, agent: str | None = None) -> str:
+    async with lock:
+        return await asyncio.to_thread(run_jarvis, uid, text, voice, agent)
+
+
+async def send_long(msg, text: str):
+    for i in range(0, len(text), 4000):
+        await msg.reply_text(text[i:i + 4000])
+
+
+async def transcribe(audio: bytes) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not set (needed for voice input)")
+    data = {"model": "whisper-large-v3-turbo", "response_format": "text"}
+    if STT_LANGUAGE:
+        data["language"] = STT_LANGUAGE
+    async with httpx.AsyncClient(timeout=120) as c:
+        r = await c.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": ("voice.ogg", audio, "audio/ogg")}, data=data)
+        r.raise_for_status()
+        return r.text.strip()
+
+
+async def synthesize(text: str) -> bytes:
+    with tempfile.TemporaryDirectory() as tmp:
+        mp3, ogg = os.path.join(tmp, "a.mp3"), os.path.join(tmp, "a.ogg")
+        await edge_tts.Communicate(text[:3000], TTS_VOICE).save(mp3)
+        subprocess.run(["ffmpeg", "-y", "-i", mp3, "-c:a", "libopus", "-b:a", "48k", ogg],
+                       check=True, capture_output=True)
+        with open(ogg, "rb") as f:
+            return f.read()
+
+
+async def reply(msg, uid: int, answer: str, heard_voice: bool):
+    mode = get_settings(uid)["voice"]
+    if mode == "on" or (mode == "auto" and heard_voice):
+        try:
+            await msg.reply_voice(await synthesize(answer))
+            return
+        except Exception:
+            log.exception("TTS failed, sending text")
+    await send_long(msg, answer)
+
+
+PUBLIC_HELP = (
+    "Hi! You can chat with me in text and ask any question (web search, calculator and weather "
+    "are built in).\n\nCommands: /voice, /voices, /forget, /help\n"
+    "More features (voice notes, images, documents, research) are for approved users."
+)
+
+
+def help_text(uid: int) -> str:
+    if is_owner(uid):
+        return HELP + OWNER_HELP
+    return HELP if is_trusted(uid) else PUBLIC_HELP
+
+
+# ---- Commands (all replies in English) ---------------------------------------
+@guard
+async def cmd_start(update, ctx):
+    await update.message.reply_text(f"Hey! I'm {BOT_NAMES[0].title()} 💅\n\n" + help_text(update.effective_user.id))
+
+
+@guard
+async def cmd_help(update, ctx):
+    await update.message.reply_text(help_text(update.effective_user.id))
+
+
+@guard
+async def cmd_voices(update, ctx):
+    await update.message.reply_text(VOICES)
+
+
+@guard
+async def cmd_forget(update, ctx):
+    await asyncio.to_thread(store.clear_history, update.effective_user.id)
+    await update.message.reply_text("Chat history cleared.")
+
+
+@full
+async def cmd_remember(update, ctx):
+    text = " ".join(ctx.args).strip()
+    if not text:
+        await update.message.reply_text("Usage: /remember <something to save permanently>")
+        return
+    await asyncio.to_thread(store.add_fact, update.effective_user.id, text)
+    await update.message.reply_text("Saved ✅")
+
+
+@full
+async def cmd_facts(update, ctx):
+    facts = await asyncio.to_thread(store.facts, update.effective_user.id)
+    if not facts:
+        await update.message.reply_text("No saved facts yet. Use /remember <text>.")
+        return
+    await send_long(update.message, "Saved facts:\n" + "\n".join(f"{i}. {f}" for i, f in enumerate(facts, 1)))
+
+
+@full
+async def cmd_clearfacts(update, ctx):
+    await asyncio.to_thread(store.clear_facts, update.effective_user.id)
+    await update.message.reply_text("All saved facts deleted.")
+
+
+@guard
+async def cmd_voice(update, ctx):
+    uid = update.effective_user.id
+    arg = ctx.args[0].lower() if ctx.args else ""
+    if arg not in ("on", "off", "auto"):
+        await update.message.reply_text(
+            f"Current: {get_settings(uid)['voice']}\nUsage: /voice on (always voice), "
+            "off (always text), auto (voice for voice, text for text)")
+        return
+    get_settings(uid)["voice"] = arg
+    await asyncio.to_thread(save_settings, uid)
+    await update.message.reply_text(f"Voice reply mode: {arg}")
+
+
+@full
+async def cmd_agent(update, ctx):
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text(
+            f"Current: {get_settings(uid)['agent']}\nOptions: native_react (with tools, default), "
+            "deep_research, orchestrator, simple, none (plain chat)\n\nUsage: /agent deep_research")
+        return
+    get_settings(uid)["agent"] = ctx.args[0]
+    await asyncio.to_thread(save_settings, uid)
+    await update.message.reply_text(f"Agent set to: {ctx.args[0]}")
+
+
+@full
+async def cmd_model(update, ctx):
+    uid = update.effective_user.id
+    if not ctx.args:
+        await update.message.reply_text(
+            f"Current: {get_settings(uid)['model'] or MODEL}\nUsage: /model gemini-2.5-flash")
+        return
+    get_settings(uid)["model"] = ctx.args[0]
+    await asyncio.to_thread(save_settings, uid)
+    await update.message.reply_text(f"Model set to: {ctx.args[0]}")
+
+
+@full
+async def cmd_memory(update, ctx):
+    async with lock:
+        stats = await asyncio.to_thread(jarvis.memory.stats)
+    db = "MongoDB" if store.db is not None else "RAM only"
+    await update.message.reply_text(f"Chat storage: {db}\nDocument memory: {stats}")
+
+
+@full
+async def cmd_research(update, ctx):
+    q = " ".join(ctx.args)
+    if not q:
+        await update.message.reply_text("Usage: /research <question>")
+        return
+    await update.message.chat.send_action(ChatAction.TYPING)
+    await update.message.reply_text("Researching, this may take a while...")
+    answer = await think(update.effective_user.id, q, False, agent="deep_research")
+    await send_long(update.message, answer)
+
+
+@full
+async def cmd_image(update, ctx):
+    prompt = " ".join(ctx.args)
+    if not prompt:
+        await update.message.reply_text("Usage: /image a lion in a jungle, cinematic")
+        return
+    await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+    url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt)
+           + "?width=1024&height=1024&nologo=true")
+    async with httpx.AsyncClient(timeout=180, follow_redirects=True) as c:
+        r = await c.get(url)
+        r.raise_for_status()
+    await update.message.reply_photo(r.content, caption=prompt[:200])
+
+
+@guard
+async def cmd_mood(update, ctx):
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        return
+    arg = ctx.args[0].lower() if ctx.args else ""
+    if arg != "random" and arg not in OWNER_MOODS:
+        await update.message.reply_text(
+            f"Current: {get_settings(uid)['mood']}\nUsage: /mood random|" + "|".join(OWNER_MOODS))
+        return
+    get_settings(uid)["mood"] = arg
+    await asyncio.to_thread(save_settings, uid)
+    await update.message.reply_text(f"Mood set to: {arg}")
+
+
+@guard
+async def cmd_sh(update, ctx):
+    if not is_owner(update.effective_user.id):
+        return
+    cmd = " ".join(ctx.args)
+    if not cmd:
+        await update.message.reply_text("Usage: /sh ls -la")
         return
 
-    if media_note:
-        source_desc += f" — Content type: {media_note}"
-
-    captured_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    raw_text = msg.text or msg.caption or "(no text/caption — media content, review manually before reporting)"
-
-    pending_evidence[user_id] = {
-        "source_desc": source_desc,
-        "link": link,
-        "captured_at": captured_at,
-        "media_note": media_note,
-        "raw_text": raw_text,
-    }
-
-    guess_key, guess_hits = detect_category(raw_text)
-    pending_evidence[user_id]["guess_hits"] = guess_hits
-
-    keyboard = [
-        [InlineKeyboardButton(v["label"], callback_data=f"cat:{k}")]
-        for k, v in CATEGORIES.items()
-    ]
-    # CSAM always shown as its own button, never auto-selected.
-    keyboard.append(
-        [InlineKeyboardButton("🛑 Child Safety Concern", callback_data="cat:csam")]
-    )
-
-    if guess_key:
-        hits_str = ", ".join(f"'{h}'" for h in guess_hits)
-        header = (
-            f"Evidence captured ✅\n\n"
-            f"🔎 Detected category (best guess): *{CATEGORIES[guess_key]['label']}*\n"
-            f"Matched on: {hits_str}\n"
-            f"If this looks right, tap that button below, or pick a "
-            f"different category:"
-        )
-    else:
-        header = (
-            "Evidence captured ✅\n\n"
-            "Couldn't auto-detect the category from the text. Please choose "
-            "manually — media-only posts (no caption) always need a manual "
-            "pick since I don't scan image/video content itself:"
-        )
-
-    await msg.reply_text(
-        header,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    def run():
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+            return (r.stdout + r.stderr).strip() or f"(no output, exit code {r.returncode})"
+        except subprocess.TimeoutExpired:
+            return "Timed out (60s)"
+    out = await asyncio.to_thread(run)
+    await send_long(update.message, out[-8000:])
 
 
-async def handle_category_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-
-    if user_id not in pending_evidence:
-        await query.edit_message_text(
-            "⚠️ The evidence seems to have expired. Please forward the "
-            "post again or send the link."
-        )
+@guard
+async def cmd_getfile(update, ctx):
+    if not is_owner(update.effective_user.id):
         return
-
-    cat_key = query.data.split(":", 1)[1]
-    ev = pending_evidence[user_id]
-
-    if cat_key == "csam":
-        # Deliberately does NOT build a report template or include any
-        # content excerpt. We do not want this bot (or its hosting) to
-        # process, store, or describe suspected CSAM content in any way —
-        # the only correct move is to route the person to the proper
-        # channels immediately.
-        await query.edit_message_text(
-            csam_guidance_text(),
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-        )
-        del pending_evidence[user_id]
+    path = " ".join(ctx.args)
+    if not path or not os.path.isfile(path):
+        await update.message.reply_text("Usage: /getfile /path/to/file (the file must exist)")
         return
-
-    cat = CATEGORIES[cat_key]
-    report_text = build_report_text(cat, ev, cat_key)
-    email_text = build_email_text(cat, ev, cat_key)
-
-    guidance = (
-        f"📋 *Report ready — {cat['label']}*\n\n"
-        f"*Report description (copy this into Telegram's report box):*\n"
-        f"```\n{report_text}\n```\n\n"
-        f"*Where to tap in the app:*\n{cat['in_app']}\n\n"
-        f"*If in-app reporting doesn't resolve it (channel reappears, or "
-        f"large-scale operation, or you want to file under EU DSA), email "
-        f"abuse@telegram.org — draft below. Add your name + contact info "
-        f"before sending; EU DSA notices need that from you personally, "
-        f"I can't fill it in for you:*\n"
-        f"```\n{email_text}\n```"
-    )
-
-    await query.edit_message_text(guidance, parse_mode=ParseMode.MARKDOWN)
-    del pending_evidence[user_id]
+    with open(path, "rb") as f:
+        await update.message.reply_document(f, filename=os.path.basename(path))
 
 
-def csam_guidance_text() -> str:
-    """Static, multi-channel reporting guidance. No user content is echoed
-    back here — nothing about the specific post is included on purpose."""
-    return (
-        "🛑 *Child Safety Concern — report directly, don't forward it any "
-        "further*\n\n"
-        "Do not forward this content to anyone else, and don't save or "
-        "download it — only report it. Reporting in *more than one place* "
-        "gets faster action:\n\n"
-        "*1. Inside Telegram (do this immediately):*\n"
-        "Open the chat/channel → ⋮ menu → *Report* → select *'Child "
-        "abuse'*. Telegram treats this category as highest priority.\n\n"
-        "*2. Telegram's dedicated child-safety inbox:*\n"
-        "stopCA@telegram.org\n\n"
-        "*3. NCMEC CyberTipline (international, the standard route):*\n"
-        "https://report.cybertip.org\n\n"
-        "*4. India — National Cyber Crime Reporting Portal:*\n"
-        "https://cybercrime.gov.in (or helpline 1930)\n\n"
-        "*5. Local police cyber cell:*\n"
-        "Also file a complaint with your city's cyber crime cell — this "
-        "creates an important legal record.\n\n"
-        "*6. If UK-related:*\n"
-        "Internet Watch Foundation — https://report.iwf.org.uk\n\n"
-        "Save the channel/message link (screenshot or t.me link) wherever "
-        "you report it, as evidence — but do not forward the actual "
-        "content itself."
-    )
+# ---- Messages ----------------------------------------------------------------
+REMEMBER_TRIGGERS = ("yaad rakhna", "yaad rakh ", "yaad rakho")
 
 
-def build_report_text(cat: dict, ev: dict, cat_key: str) -> str:
-    """Structured, category-specific report pulled together from THIS
-    message's actual content — not a static paragraph reused every time."""
-    signals = extract_signals(ev["raw_text"])
-    hits = ev.get("guess_hits") or matched_keywords(ev["raw_text"], cat_key)
-
-    lines = [
-        cat["reason"],
-        "",
-        f"Source: {ev['source_desc']}",
-        f"Captured at: {ev['captured_at']} (UTC)",
-    ]
-    if ev.get("link"):
-        lines.append(f"Link: {ev['link']}")
-    if hits:
-        lines.append(f"Matched terms in message: {', '.join(hits)}")
-    if signals["urls"]:
-        lines.append(f"Linked URLs in message: {', '.join(signals['urls'])}")
-    if signals["handles"]:
-        lines.append(f"Handles mentioned: {', '.join(signals['handles'])}")
-    if signals["phones"]:
-        lines.append(f"Phone numbers mentioned: {', '.join(signals['phones'])}")
-    if signals["amounts"]:
-        lines.append(f"Amounts mentioned: {', '.join(signals['amounts'])}")
-
-    lines += [
-        "",
-        f"Policy basis: {cat['tos_clause']}",
-        "",
-        f"Requested action: {cat['requested_action']}",
-    ]
-    return "\n".join(lines)
+@guard
+async def on_text(update, ctx):
+    uid, text = update.effective_user.id, update.message.text
+    if in_group(update) and not addressed(update, ctx):
+        return
+    if not is_trusted(uid) and public_limit_hit(uid):
+        await update.message.reply_text(
+            f"Daily limit reached ({PUBLIC_DAILY_LIMIT} messages). Please try again tomorrow.")
+        return
+    await update.message.chat.send_action(ChatAction.TYPING)
+    if is_trusted(uid) and any(t in text.lower() for t in REMEMBER_TRIGGERS):
+        await asyncio.to_thread(store.add_fact, uid, text)
+    answer = await think(uid, text, False)
+    await reply(update.message, uid, answer, heard_voice=False)
 
 
-def build_email_text(cat: dict, ev: dict, cat_key: str) -> str:
-    report_body = build_report_text(cat, ev, cat_key)
-    return (
-        f"To: abuse@telegram.org\n"
-        f"Subject: {cat['email_subject']}\n\n"
-        f"Hello Telegram Trust & Safety team,\n\n"
-        f"I am reporting the following content, which I believe violates "
-        f"Telegram's Terms of Service"
-        f"{' and may be reportable under the EU Digital Services Act' if True else ''}:\n\n"
-        f"{report_body}\n\n"
-        f"[Your name]\n"
-        f"[Your contact email/phone — required for EU DSA notices per "
-        f"Article 16]\n\n"
-        f"Thank you for your attention to this report."
-    )
+@full
+async def on_voice(update, ctx):
+    uid, msg = update.effective_user.id, update.message
+    if in_group(update) and not addressed(update, ctx):
+        return
+    await msg.chat.send_action(ChatAction.RECORD_VOICE)
+    tg_file = await (msg.voice or msg.audio).get_file()
+    heard = await transcribe(bytes(await tg_file.download_as_bytearray()))
+    if not heard:
+        await msg.reply_text("Couldn't understand the audio, please try again.")
+        return
+    if any(t in heard.lower() for t in REMEMBER_TRIGGERS):
+        await asyncio.to_thread(store.add_fact, uid, heard)
+    answer = await think(uid, heard, True)
+    await reply(msg, uid, answer, heard_voice=True)
 
 
-# ---------------------------------------------------------------------------
-# App wiring
-# ---------------------------------------------------------------------------
+@full
+async def on_document(update, ctx):
+    msg, doc = update.message, update.message.document
+    if in_group(update) and not addressed(update, ctx):
+        return
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await msg.reply_text("File is larger than 20 MB (Telegram bot limit).")
+        return
+    await msg.chat.send_action(ChatAction.TYPING)
+    tg_file = await doc.get_file()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, doc.file_name or "file.txt")
+        await tg_file.download_to_drive(path)
+        async with lock:
+            result = await asyncio.to_thread(jarvis.memory.index, path)
+    await msg.reply_text(f"Read '{doc.file_name}' and saved it to memory ✅\n{result}\n"
+                         "You can now ask questions about this file.")
+
+
+def vision(image: bytes, question: str) -> str:
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+    r = client.models.generate_content(
+        model=VISION_MODEL,
+        contents=[types.Part.from_bytes(data=image, mime_type="image/jpeg"),
+                  f"{TEXT_RULE}\n\n{question}"])
+    return (r.text or "").strip() or "Photo ka jawab nahi aaya, dobara try karo."
+
+
+@full
+async def on_photo(update, ctx):
+    msg = update.message
+    if in_group(update) and not addressed(update, ctx):
+        return
+    await msg.chat.send_action(ChatAction.TYPING)
+    tg_file = await msg.photo[-1].get_file()
+    img = bytes(await tg_file.download_as_bytearray())
+    question = msg.caption or "Is photo mein kya hai? Detail mein batao."
+    answer = await asyncio.to_thread(vision, img, question)
+    await send_long(msg, answer)
+
+
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is not set.")
-
     app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", handle_start))
-    app.add_handler(
-        MessageHandler(
-            (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ANIMATION
-             | filters.Sticker.ALL | filters.Document.ALL) & ~filters.COMMAND,
-            handle_incoming,
-        )
-    )
-    app.add_handler(CallbackQueryHandler(handle_category_choice, pattern=r"^cat:"))
-
-    logger.info("Bot starting...")
+    for name, fn in [("start", cmd_start), ("help", cmd_help), ("voices", cmd_voices),
+                     ("forget", cmd_forget), ("remember", cmd_remember), ("facts", cmd_facts),
+                     ("clearfacts", cmd_clearfacts), ("voice", cmd_voice), ("agent", cmd_agent),
+                     ("model", cmd_model), ("memory", cmd_memory), ("research", cmd_research),
+                     ("image", cmd_image), ("sh", cmd_sh), ("getfile", cmd_getfile), ("mood", cmd_mood)]:
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    log.info("Bot started (engine=%s model=%s agent=%s mongo=%s)", ENGINE, MODEL, DEFAULT_AGENT,
+             store.db is not None)
     app.run_polling()
 
 

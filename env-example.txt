@@ -1,0 +1,27 @@
+# Railway > service > Variables (real keys GitHub par mat daalna)
+TELEGRAM_BOT_TOKEN=token-from-BotFather
+GEMINI_API_KEY=free-key-from-aistudio.google.com
+GROQ_API_KEY=free-key-from-console.groq.com
+ALLOWED_USER_IDS=123456789,987654321
+# optional: everyone else can chat (text only) with limits
+PUBLIC_ACCESS=true
+PUBLIC_DAILY_LIMIT=20
+# sirf aap (owner) ko shell/code/file/browser tools milenge
+OWNER_ID=123456789
+# optional
+JARVIS_MODEL=gemini-2.5-flash
+JARVIS_AGENT=native_react
+JARVIS_TOOLS=web_search,calculator,think,get_weather,memory_search
+TTS_VOICE=en-IN-NeerjaNeural
+STT_LANGUAGE=hi
+# optional better web search (free tier)
+TAVILY_API_KEY=
+# persona (optional, defaults are already Harsh / @izoph)
+OWNER_NAME=Harsh
+OWNER_TG=@izoph
+# MongoDB Atlas connection string (chat history, facts, settings)
+MONGODB_URI=mongodb+srv://user:password@cluster.mongodb.net/?retryWrites=true&w=majority
+MONGODB_DB=jarvis_bot
+HISTORY_LIMIT=30
+# names the bot answers to in groups (comma separated)
+BOT_NAMES=baddie

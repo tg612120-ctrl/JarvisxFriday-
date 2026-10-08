@@ -1,66 +1,45 @@
-# Telegram Illegal-Content Report Assistant
+# OpenJarvis Telegram Bot (full, Railway)
 
-A bot that helps you build a **clean, well-structured report** for Telegram's
-in-app abuse reporting system. Forward a suspicious post (or send its
-`t.me` link), pick a category, and it hands you back:
+Chat, voice-in/voice-out, web search, deep research, image generation, document Q&A.
 
-- A copy-paste report description
-- The exact in-app steps (which menu, which button) for that category
-- A fallback email draft for `abuse@telegram.org`
+## Deploy
+1. Push this folder to GitHub.
+2. railway.com > New Project > Deploy from GitHub repo.
+3. Variables: see `.env.example` (TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, GROQ_API_KEY, ALLOWED_USER_IDS).
+4. Optional: add a Volume mounted at `/data` so memory/documents survive redeploys.
 
-**It does not file the report for you** — Telegram has no public API for
-submitting abuse reports (this is intentional, to prevent report-spam). A
-human still has to tap "Report" in the app or send the email. This bot just
-makes sure that report is complete and well-formatted, which makes it much
-more likely to get acted on.
+## Commands
+/start /help /research /image /remember /facts /clearfacts /agent /model /voice /voices /forget /memory
+Send a voice note -> voice reply. Send a document -> indexed into memory.
 
-**Not for CSAM.** Child sexual abuse material must go straight to
-[NCMEC's CyberTipline](https://report.cybertip.org) or your local police
-cyber-crime cell — not through a general-purpose bot. The bot tells users
-this in `/start`.
+## Free voices
+hi-IN-SwaraNeural, hi-IN-MadhurNeural, en-IN-NeerjaNeural, en-IN-PrabhatNeural,
+en-US-JennyNeural, en-US-GuyNeural  (set `TTS_VOICE`)
 
-## 1. Create the bot
+## Groups
+Add the bot to a group. It replies when someone says its name (`BOT_NAMES`, default "baddie"),
+@mentions it, or replies to its message. In BotFather run /setprivacy -> your bot -> Disable,
+otherwise Telegram will not show it normal group messages.
 
-1. Message [@BotFather](https://t.me/BotFather) on Telegram
-2. `/newbot` → follow the prompts → copy the token it gives you
+## Access levels
+- Owner (`OWNER_ID`): everything, including shell/code/files/browser.
+- Approved (`ALLOWED_USER_IDS`): all features (voice, images, documents, research, photos, settings, memory).
+- Everyone else (`PUBLIC_ACCESS=true`): text chat and questions only (web search, calculator, weather),
+  `PUBLIC_DAILY_LIMIT` messages per day. They cannot see your documents or memory.
+  Set `PUBLIC_ACCESS=false` to block strangers completely.
 
-## 2. Push to GitHub
+## MongoDB
+Set `MONGODB_URI` (MongoDB Atlas free M0 cluster; allow 0.0.0.0/0 in Network Access).
+Stores chat history, saved facts and per-user settings. Without it the bot uses RAM only.
+Document (PDF) memory is separate and needs a Railway Volume at `/data`.
 
-```bash
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin https://github.com/<your-username>/<repo-name>.git
-git push -u origin main
-```
+## Language
+Bot messages (commands/help/status/errors) are English. Conversation (text + voice) is Hinglish.
 
-## 3. Deploy on Railway
+## Owner-only power tools
+Set `OWNER_ID` (your Telegram ID). Only that user gets shell, code run, file read/write and browser
+tools (agent uses them from plain chat), plus `/sh` and `/getfile`. Without `OWNER_ID` they stay off.
+Photo understanding (Gemini vision) works for every allowed user.
 
-1. [railway.app](https://railway.app) → New Project → **Deploy from GitHub repo**
-2. Select your repo
-3. Go to the service → **Variables** tab → add:
-   - `BOT_TOKEN` = the token from BotFather
-4. Railway will auto-detect the `Procfile` and run `python bot.py` as a worker
-5. Deploy — check the **Logs** tab for `Bot starting...`
-
-Railway's free tier (~$5/month trial credit, no card needed initially) is
-enough for a low-traffic bot like this one running on long-polling.
-
-## 4. Test it
-
-- Open your bot in Telegram, hit `/start`
-- Forward a post from any public channel, or paste a `t.me/...` link
-- Pick a category → get your report text + instructions
-
-## Notes / possible improvements
-
-- Currently stores one pending report per user in memory — fine for
-  personal/low-traffic use. For multi-user scale, swap `pending_evidence`
-  dict for SQLite or Redis so it survives restarts.
-- Copyright category has no in-app report option on Telegram — the bot
-  correctly routes that one to the email template only.
-- You can extend `CATEGORIES` in `bot.py` with more categories or
-  region-specific reporting bodies (e.g. India's cybercrime portal
-  cybercrime.gov.in) if you want a local reporting path alongside
-  Telegram's own.
+## Not included
+Gmail/Calendar digest (needs your OAuth), local models (Railway has no GPU).

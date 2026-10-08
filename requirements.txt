@@ -1,1 +1,5 @@
-python-telegram-bot==21.4
+openjarvis[inference-google,tools-search,memory-pdf,browser]
+python-telegram-bot>=21
+edge-tts>=6.1
+httpx
+pymongo[srv]>=4.9
