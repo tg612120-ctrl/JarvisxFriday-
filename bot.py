@@ -50,8 +50,8 @@ BOT_NAMES = [n.strip().lower() for n in os.environ.get("BOT_NAMES", "baddie").sp
 OWNER_NAME = os.environ.get("OWNER_NAME", "Harsh")
 OWNER_TG = os.environ.get("OWNER_TG", "@izoph")
 ENGINE = os.environ.get("JARVIS_ENGINE", "cloud")
-MODEL = os.environ.get("JARVIS_MODEL", "gemini-2.5-flash")        # needs GEMINI_API_KEY (free tier)
-VISION_MODEL = os.environ.get("VISION_MODEL", "gemini-2.5-flash")
+MODEL = os.environ.get("JARVIS_MODEL", "gemini-3.8-flash")        # needs GEMINI_API_KEY (free tier)
+VISION_MODEL = os.environ.get("VISION_MODEL", "gemini-3.8-flash")
 DEFAULT_AGENT = os.environ.get("JARVIS_AGENT", "native_react")
 TOOLS = [t for t in os.environ.get(
     "JARVIS_TOOLS", "web_search,calculator,think,get_weather,memory_search").split(",") if t]
@@ -88,12 +88,16 @@ class Store:
 
     # chat history
     def history(self, uid: int, n: int):
+        if n <= 0:  # 0 = no chat memory (note: pymongo limit(0) would mean "no limit")
+            return []
         if self.db is not None:
             docs = list(self.db.history.find({"uid": uid}).sort("ts", -1).limit(n))
             return [(d["role"], d["text"]) for d in reversed(docs)]
         return self._hist[uid][-n:]
 
     def add(self, uid: int, role: str, text: str):
+        if HISTORY_LIMIT <= 0:
+            return
         if self.db is not None:
             self.db.history.insert_one({"uid": uid, "role": role, "text": text, "ts": time.time()})
         else:
@@ -179,12 +183,14 @@ MOODS = {
     "flirty": "Flirty and teasing: playful compliments, light romantic banter, a little cheeky.",
     "smolder": ("Sexy-confident and seductive in tone: low-key, teasing, charming, slightly mysterious. "
                 "Suggestive vibe only, never explicit or sexual content."),
+    "tease": ("Bold, slow-burn teasing: intense flirty banter, playful dares, charged "
+              "chemistry and double-meaning wit. Suggestive vibe only, never explicit or sexual content."),
     "dark": "Dark, moody and mysterious: poetic, a bit gothic, deadpan humor, cryptic one-liners.",
     "attitude": "Sassy with attitude: bossy, sharp comebacks, unimpressed but still helpful.",
     "sweet": "Soft, caring and affectionate: warm and gentle.",
     "savage": "Savage roasting humor: witty and cutting but never cruel or hateful.",
 }
-OWNER_MOODS = ["flirty", "smolder", "dark", "attitude", "sweet", "savage"]
+OWNER_MOODS = ["flirty", "smolder", "tease", "dark", "attitude", "sweet", "savage"]
 GUEST_MOODS = ["attitude", "dark", "sweet", "savage"]  # no romantic moods for others
 _last_mood: dict = {}
 
@@ -315,6 +321,44 @@ def full(fn):  # approved users only
     return _wrap(fn, True)
 
 
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gemini-flash-latest")
+
+
+def _busy(e: Exception) -> bool:
+    m = str(e)
+    return any(x in m for x in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
+                                "overloaded", "high demand"))
+
+
+def ask_resilient(prompt: str, agent: str | None, tools: list, model: str | None) -> str:
+    """Retry when Gemini is busy (503/429), then fall back to FALLBACK_MODEL."""
+    def once(m, use_agent):
+        if use_agent and use_agent != "none":
+            return jarvis.ask(prompt, agent=use_agent, tools=tools, model=m)
+        return jarvis.ask(prompt, model=m)
+
+    last = None
+    for m in (model or MODEL, model or MODEL, FALLBACK_MODEL):
+        try:
+            return once(m, agent)
+        except Exception as e:
+            last = e
+            if _busy(e):
+                log.warning("model '%s' busy (%s); retrying/falling back", m, e)
+                time.sleep(2)
+                continue
+            log.warning("agent '%s' failed (%s); trying plain chat", agent, e)
+            try:
+                return once(m, None)
+            except Exception as e2:
+                last = e2
+                if _busy(e2):
+                    time.sleep(2)
+                    continue
+                raise
+    raise last
+
+
 def run_jarvis(uid: int, text: str, voice: bool, agent: str | None = None) -> str:
     s = get_settings(uid)
     past = "\n".join(f"{r}: {t}" for r, t in store.history(uid, HISTORY_LIMIT))
@@ -333,14 +377,7 @@ def run_jarvis(uid: int, text: str, voice: bool, agent: str | None = None) -> st
     else:
         tools = PUBLIC_TOOLS                 # strangers: no access to your documents/memory
     use_agent = (agent or s["agent"]) if is_trusted(uid) else DEFAULT_AGENT
-    try:
-        if use_agent and use_agent != "none":
-            answer = jarvis.ask(prompt, agent=use_agent, tools=tools, model=s["model"])
-        else:
-            answer = jarvis.ask(prompt, model=s["model"])
-    except Exception as e:  # agent/tool problem -> plain chat fallback
-        log.warning("agent '%s' failed (%s); falling back to plain chat", use_agent, e)
-        answer = jarvis.ask(prompt, model=s["model"])
+    answer = ask_resilient(prompt, use_agent, tools, s["model"])
     answer = (answer or "").strip() or "Kuch jawab nahi aaya, dobara try karo."
     store.add(uid, "User", text)
     store.add(uid, "Assistant", answer)
@@ -485,7 +522,7 @@ async def cmd_model(update, ctx):
     uid = update.effective_user.id
     if not ctx.args:
         await update.message.reply_text(
-            f"Current: {get_settings(uid)['model'] or MODEL}\nUsage: /model gemini-2.5-flash")
+            f"Current: {get_settings(uid)['model'] or MODEL}\nUsage: /model gemini-3.8-flash")
         return
     get_settings(uid)["model"] = ctx.args[0]
     await asyncio.to_thread(save_settings, uid)
