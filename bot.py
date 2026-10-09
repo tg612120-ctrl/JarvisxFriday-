@@ -190,7 +190,7 @@ MOODS = {
     "sweet": "Soft, caring and affectionate: warm and gentle.",
     "savage": "Savage roasting humor: witty and cutting but never cruel or hateful.",
 }
-OWNER_MOODS = ["flirty", "smolder", "tease", "dark", "attitude", "sweet", "savage", "horny", "explicit"]
+OWNER_MOODS = ["flirty", "smolder", "tease", "dark", "attitude", "sweet", "savage", "horny", "ecchi", "hentai"]
 GUEST_MOODS = ["attitude", "dark", "sweet", "savage"]  # no romantic moods for others
 _last_mood: dict = {}
 
